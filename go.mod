@@ -1,3 +1,3 @@
-module github.com/schnuartz/specter-virtual-host
+module github.com/cryptoadvance/specter-virtual-host
 
 go 1.22

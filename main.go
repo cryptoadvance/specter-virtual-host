@@ -257,7 +257,9 @@ func allowedOrigin(origin string) bool {
 		return false
 	}
 	host := parsed.Hostname()
-	return (parsed.Scheme == "https" && host == "try.clavastack.com") ||
+	port := parsed.Port()
+	securePort := port == "" || port == "443"
+	return (parsed.Scheme == "https" && securePort && (host == "try.clavastack.com" || host == "cryptoadvance.github.io")) ||
 		((parsed.Scheme == "http" || parsed.Scheme == "https") &&
 			(host == "127.0.0.1" || host == "localhost" || host == "::1"))
 }
@@ -341,8 +343,17 @@ func serveStableSimulator(proxy http.Handler, w http.ResponseWriter, r *http.Req
 	proxy.ServeHTTP(w, r)
 }
 
+func serveVirtualHostHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if origin := r.Header.Get("Origin"); origin != "" && allowedOrigin(origin) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "version": version})
+}
+
 func main() {
-	upstreamFlag := flag.String("site", "https://try.clavastack.com", "simulator site to open through the local bridge")
+	upstreamFlag := flag.String("site", "https://cryptoadvance.github.io/specter-diy/", "simulator site to open through the local bridge")
 	noOpen := flag.Bool("no-open", false, "do not open the connected simulator in the default browser")
 	flag.Parse()
 	upstream, err := url.Parse(*upstreamFlag)
@@ -380,11 +391,7 @@ func main() {
 		}
 		b.handleBrowser(ws, clientID)
 	})
-	mux.HandleFunc("/virtual-host-health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "https://try.clavastack.com")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "version": version})
-	})
+	mux.HandleFunc("/virtual-host-health", serveVirtualHostHealth)
 	mux.HandleFunc("/connected", serveConnectedSimulator)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		serveStableSimulator(proxy, w, r)

@@ -58,6 +58,7 @@ func readServerFrame(t *testing.T, reader *bufio.Reader) (byte, []byte) {
 func TestAllowedOrigin(t *testing.T) {
 	for _, origin := range []string{
 		"https://try.clavastack.com",
+		"https://cryptoadvance.github.io",
 		"http://127.0.0.1:8788",
 		"http://localhost:8765",
 	} {
@@ -65,9 +66,27 @@ func TestAllowedOrigin(t *testing.T) {
 			t.Fatalf("expected origin to be allowed: %s", origin)
 		}
 	}
-	for _, origin := range []string{"https://example.com", "http://try.clavastack.com", "null", ""} {
+	for _, origin := range []string{"https://example.com", "https://cryptoadvance.github.io:444", "http://try.clavastack.com", "http://cryptoadvance.github.io", "null", ""} {
 		if allowedOrigin(origin) {
 			t.Fatalf("expected origin to be rejected: %s", origin)
+		}
+	}
+}
+
+func TestVirtualHostHealthUsesAllowedRequestOrigin(t *testing.T) {
+	for _, test := range []struct {
+		origin string
+		want   string
+	}{
+		{origin: "https://cryptoadvance.github.io", want: "https://cryptoadvance.github.io"},
+		{origin: "https://untrusted.example", want: ""},
+	} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8788/virtual-host-health", nil)
+		request.Header.Set("Origin", test.origin)
+		serveVirtualHostHealth(recorder, request)
+		if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != test.want {
+			t.Fatalf("origin %q: Access-Control-Allow-Origin = %q, want %q", test.origin, got, test.want)
 		}
 	}
 }

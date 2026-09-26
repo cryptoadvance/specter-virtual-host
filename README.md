@@ -1,8 +1,11 @@
 # Specter Virtual Host
 
 Specter Virtual Host is a cross-platform local bridge that connects the
-Specter DIY web simulator to desktop wallet software through Specter DIY's
-official simulator USB protocol.
+[`cryptoadvance/specter-diy` browser simulator](https://cryptoadvance.github.io/specter-diy/)
+to Specter Desktop through Specter DIY's simulator USB protocol. The firmware
+and browser tooling live in
+[`cryptoadvance/specter-diy`](https://github.com/cryptoadvance/specter-diy) and
+[`cryptoadvance/specter-diy-web-simulator`](https://github.com/cryptoadvance/specter-diy-web-simulator).
 
 Everything stays on the same computer:
 
@@ -23,9 +26,10 @@ Gatekeeper approval.
 
 ## Usage
 
-Run the matching release binary and keep its window open. By default it opens
-the local connected simulator and proxies the configured simulator site. For
-local website development:
+Download the matching binary from the
+[latest Virtual Host release](https://github.com/cryptoadvance/specter-virtual-host/releases/latest)
+and keep its window open. By default it opens the local connected simulator
+and proxies the official GitHub Pages site. For local website development:
 
 ```text
 specter-virtual-host --site http://127.0.0.1:8765
@@ -42,8 +46,10 @@ go test ./...
 go run . --site http://127.0.0.1:8765 --no-open
 ```
 
-The WebSocket bridge accepts only local browser origins or the production
-ClavaStack origin and binds only to loopback addresses.
+The WebSocket bridge accepts only local browser origins, the official
+`cryptoadvance.github.io` Pages origin, or the legacy ClavaStack origin. It
+binds only to loopback addresses; firmware USB bytes are forwarded between the
+browser worker and Specter Desktop on this computer.
 
 ## License
 

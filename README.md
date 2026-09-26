@@ -29,7 +29,9 @@ Gatekeeper approval.
 Download the matching binary from the
 [latest Virtual Host release](https://github.com/cryptoadvance/specter-virtual-host/releases/latest)
 and keep its window open. By default it opens the local connected simulator
-and proxies the official GitHub Pages site. For local website development:
+and proxies the official GitHub Pages site. Until a new release is published,
+older binaries may still use the legacy site; override it explicitly with
+`--site https://cryptoadvance.github.io/specter-diy/`. For local website development:
 
 ```text
 specter-virtual-host --site http://127.0.0.1:8765

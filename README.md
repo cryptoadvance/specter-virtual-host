@@ -7,6 +7,8 @@ and browser tooling live in
 [`cryptoadvance/specter-diy`](https://github.com/cryptoadvance/specter-diy) and
 [`cryptoadvance/specter-diy-web-simulator`](https://github.com/cryptoadvance/specter-diy-web-simulator).
 
+<img width="1672" height="941" alt="specter-virtual-host-grafik" src="https://github.com/user-attachments/assets/27e155d2-a5b8-4ca8-b79d-10d3bd209285" />
+
 Everything stays on the same computer:
 
 - `127.0.0.1:8788` serves the connected simulator page and browser bridge.

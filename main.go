@@ -193,7 +193,7 @@ func (b *bridge) handleBrowser(ws *wsConn, clientID string) {
 			host := b.hostSnapshot()
 			if host != nil {
 				if _, err := host.Write(payload); err != nil {
-					log.Printf("Unable to write firmware response to Specter Desktop: %v", err)
+					log.Printf("Unable to write firmware response to host application: %v", err)
 				}
 			}
 		case 8:
@@ -208,8 +208,8 @@ func (b *bridge) handleBrowser(ws *wsConn, clientID string) {
 func (b *bridge) handleHost(conn net.Conn) {
 	b.mu.Lock()
 	if b.host != nil {
-		// Specter Desktop first opens and immediately closes a probe connection,
-		// then opens the real query connection. Replace a not-yet-reaped probe
+		// The wallet application may open and immediately close a probe connection,
+		// then open the real query connection. Replace a not-yet-reaped probe
 		// instead of racing and rejecting the query.
 		_ = b.host.Close()
 	}
@@ -221,7 +221,7 @@ func (b *bridge) handleHost(conn net.Conn) {
 	b.host = conn
 	b.mu.Unlock()
 	b.sendStatus("host", true)
-	log.Printf("Specter Desktop connected")
+	log.Printf("Host application connected")
 	defer func() {
 		b.mu.Lock()
 		wasCurrent := b.host == conn
@@ -233,7 +233,7 @@ func (b *bridge) handleHost(conn net.Conn) {
 		if wasCurrent {
 			b.sendStatus("host", false)
 		}
-		log.Printf("Specter Desktop disconnected")
+		log.Printf("Host application disconnected")
 	}()
 
 	buffer := make([]byte, 32*1024)
@@ -399,7 +399,7 @@ func main() {
 
 	hwiListener, err := net.Listen("tcp", hwiAddress)
 	if err != nil {
-		log.Fatalf("Cannot open the Specter Desktop port %s: %v", hwiAddress, err)
+		log.Fatalf("Cannot open the HWI endpoint %s: %v", hwiAddress, err)
 	}
 	defer hwiListener.Close()
 	go func() {
@@ -422,8 +422,8 @@ func main() {
 	connectedURL := "http://" + webAddress + "/connected"
 	fmt.Printf("\nClavaStack Virtual Host %s\n", version)
 	fmt.Printf("Connected simulator: %s\n", connectedURL)
-	fmt.Printf("Specter Desktop:     %s\n\n", hwiAddress)
-	fmt.Println("Keep this window open while using Specter Desktop.")
+	fmt.Printf("Wallet / HWI endpoint: %s\n\n", hwiAddress)
+	fmt.Println("Keep this window open while using your wallet software.")
 	fmt.Println("Only use public test seeds in the browser simulator.")
 	if !*noOpen {
 		if err := openBrowser(connectedURL); err != nil {

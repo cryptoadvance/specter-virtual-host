@@ -1,2 +1,9 @@
 dist/
+!frontend/dist/
+!frontend/dist/**
+build/bin/
+build/windows/info.json
+build/windows/wails.exe.manifest
+build/darwin/*.icns
+build/windows/*.ico
 *.log

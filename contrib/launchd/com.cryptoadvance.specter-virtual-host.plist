@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.cryptoadvance.specter-virtual-host</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/Specter Virtual Host.app/Contents/MacOS/Specter-Virtual-Host</string>
+		<string>serve</string>
+		<string>--headless</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/specter-virtual-host.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/specter-virtual-host.err.log</string>
+</dict>
+</plist>

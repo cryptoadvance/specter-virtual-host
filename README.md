@@ -6,6 +6,9 @@ official simulator USB protocol.
 
 <img width="1672" height="941" alt="specter-virtual-host-grafik" src="https://github.com/user-attachments/assets/27e155d2-a5b8-4ca8-b79d-10d3bd209285" />
 
+<img width="1535" height="810" alt="image" src="https://github.com/user-attachments/assets/6052b575-4ca9-44b5-b2c9-7ed591b1429b" />
+
+
 Everything stays on the same computer:
 
 - `127.0.0.1:8788` serves the connected simulator page and browser bridge.

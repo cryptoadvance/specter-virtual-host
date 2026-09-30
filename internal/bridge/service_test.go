@@ -48,9 +48,6 @@ func newTestWebSocketPair(t *testing.T) (*wsConn, *testWSClient) {
 	}
 	client := &testWSClient{conn: clientConn, frames: make(chan testWSFrame, 64)}
 	clientConn.SetPingHandler(func(data string) error {
-		if err := clientConn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(writeTimeout)); err != nil {
-			return err
-		}
 		client.frames <- testWSFrame{wire: unmaskedTestFrame(websocket.PingMessage, []byte(data))}
 		return nil
 	})
@@ -388,25 +385,29 @@ func TestBrowserSessionPromotesStandbyWhenActiveDisconnects(t *testing.T) {
 	defer secondClient.Close()
 	go service.handleBrowser(secondServer, "second-tab", "https://second.example")
 	secondReader := bufio.NewReader(secondClient)
-	// A newer tab becomes active, but the old tab stays connected in standby.
-	if opcode, _ := readServerFrame(t, firstReader); opcode != 1 {
-		t.Fatalf("first-tab standby status opcode = %d, want hello", opcode)
-	}
+	// The first session remains active; later websites wait in standby.
 	if opcode, _ := readServerFrame(t, secondReader); opcode != 1 {
 		t.Fatalf("second hello opcode = %d, want text", opcode)
 	}
-	if status := service.Status(); status.BrowserOrigin != "https://second.example" {
-		t.Fatalf("active browser origin = %q, want newest tab", status.BrowserOrigin)
+	if status := service.Status(); status.BrowserOrigin != "https://first.example" {
+		t.Fatalf("active browser origin = %q, want original tab", status.BrowserOrigin)
+	}
+	thirdServer, thirdClient := newTestWebSocketPair(t)
+	defer thirdClient.Close()
+	go service.handleBrowser(thirdServer, "third-tab", "https://third.example")
+	thirdReader := bufio.NewReader(thirdClient)
+	if opcode, _ := readServerFrame(t, thirdReader); opcode != 1 {
+		t.Fatalf("third hello opcode = %d, want text", opcode)
 	}
 	if _, err := secondClient.Write(maskedFrame(9, []byte("ping"))); err != nil {
-		t.Fatalf("write active-tab ping: %v", err)
+		t.Fatalf("write standby-tab ping: %v", err)
 	}
 	if opcode, _ := readServerFrame(t, secondReader); opcode != 10 {
 		t.Fatalf("active-tab ping response opcode = %d, want pong", opcode)
 	}
 
-	_ = secondClient.Close()
-	opcode, payload := readServerFrame(t, firstReader)
+	_ = firstClient.Close()
+	opcode, payload := readServerFrame(t, secondReader)
 	if opcode != 1 {
 		t.Fatalf("promoted tab frame opcode = %d, want hello", opcode)
 	}
@@ -416,8 +417,15 @@ func TestBrowserSessionPromotesStandbyWhenActiveDisconnects(t *testing.T) {
 	if err := json.Unmarshal(payload, &hello); err != nil || hello.Type != "hello" {
 		t.Fatalf("promoted tab hello = %q, err %v", payload, err)
 	}
-	if status := service.Status(); status.BrowserOrigin != "https://first.example" {
-		t.Fatalf("promoted browser origin = %q, want first tab", status.BrowserOrigin)
+	if status := service.Status(); status.BrowserOrigin != "https://second.example" {
+		t.Fatalf("promoted browser origin = %q, want standby tab", status.BrowserOrigin)
+	}
+	_ = secondClient.Close()
+	if opcode, _ := readServerFrame(t, thirdReader); opcode != 1 {
+		t.Fatalf("next standby promotion opcode = %d, want hello", opcode)
+	}
+	if status := service.Status(); status.BrowserOrigin != "https://third.example" {
+		t.Fatalf("next promoted browser origin = %q, want third tab", status.BrowserOrigin)
 	}
 }
 
@@ -433,6 +441,23 @@ func TestCurrentBrowserBlocksLegacyReconnect(t *testing.T) {
 	if !service.acceptsBrowserClient("new-tab") {
 		t.Fatal("a new current browser should be accepted")
 	}
+}
+
+func TestLegacyQuarantineIsBoundToOneWebSocket(t *testing.T) {
+	service := New("test", func() model.Settings { return model.DefaultSettings() }, nil)
+	interrupted := &wsConn{}
+	reloaded := &wsConn{}
+	service.mu.Lock()
+	service.quarantineBrowserLocked(interrupted, "")
+	if !service.browserQuarantinedLocked(interrupted, "") {
+		service.mu.Unlock()
+		t.Fatal("interrupted legacy WebSocket was not quarantined")
+	}
+	if service.browserQuarantinedLocked(reloaded, "") {
+		service.mu.Unlock()
+		t.Fatal("a reloaded legacy WebSocket inherited the previous connection's quarantine")
+	}
+	service.mu.Unlock()
 }
 
 func TestBridgeRoundTrip(t *testing.T) {
@@ -459,20 +484,20 @@ func TestBridgeRoundTrip(t *testing.T) {
 
 	standbyServer, standbyClient := newTestWebSocketPair(t)
 	defer standbyClient.Close()
-	go service.handleBrowser(standbyServer, "first-tab", "https://example.com")
+	go service.handleBrowser(standbyServer, "first-tab", "https://first.example")
 	standbyReader := bufio.NewReader(standbyClient)
 	if opcode, _ := readServerFrame(t, standbyReader); opcode != 1 {
 		t.Fatalf("hello opcode = %d", opcode)
 	}
 	browserServer, browserClient := newTestWebSocketPair(t)
 	defer browserClient.Close()
-	go service.handleBrowser(browserServer, "newest-tab", "https://example.com")
+	go service.handleBrowser(browserServer, "newest-tab", "https://second.example")
 	browserReader := bufio.NewReader(browserClient)
-	if opcode, _ := readServerFrame(t, standbyReader); opcode != 1 {
-		t.Fatalf("standby update opcode = %d", opcode)
-	}
 	if opcode, _ := readServerFrame(t, browserReader); opcode != 1 {
-		t.Fatalf("active hello opcode = %d", opcode)
+		t.Fatalf("standby hello opcode = %d", opcode)
+	}
+	if status := service.Status(); status.BrowserOrigin != "https://first.example" {
+		t.Fatalf("new standby took over active browser: %+v", status)
 	}
 
 	hostClient, err := net.DialTimeout("tcp", service.hwiListener.Addr().String(), time.Second)
@@ -480,29 +505,26 @@ func TestBridgeRoundTrip(t *testing.T) {
 		t.Fatalf("connect to HWI TCP listener: %v", err)
 	}
 	defer hostClient.Close()
-	if opcode, _ := readServerFrame(t, browserReader); opcode != 1 {
-		t.Fatalf("host status opcode = %d", opcode)
+	if opcode, _ := readServerFrame(t, standbyReader); opcode != 1 {
+		t.Fatalf("active host status opcode = %d", opcode)
 	}
 	command := []byte("\r\n\r\nfingerprint\r\n")
 	if _, err := hostClient.Write(command); err != nil {
 		t.Fatalf("write HWI command: %v", err)
 	}
-	opcode, payload := readServerFrame(t, browserReader)
+	opcode, payload := readServerFrame(t, standbyReader)
 	if opcode != 2 || string(payload) != string(command) {
 		t.Fatalf("host-to-browser = (%d, %q)", opcode, payload)
 	}
 	latestServer, latestClient := newTestWebSocketPair(t)
 	defer latestClient.Close()
-	go service.handleBrowser(latestServer, "latest-tab", "https://example.com")
-	if opcode, _ := readServerFrame(t, browserReader); opcode != 1 {
-		t.Fatalf("in-flight tab status opcode = %d", opcode)
-	}
+	go service.handleBrowser(latestServer, "latest-tab", "https://third.example")
 	latestReader := bufio.NewReader(latestClient)
 	if opcode, _ := readServerFrame(t, latestReader); opcode != 1 {
 		t.Fatalf("latest tab hello opcode = %d", opcode)
 	}
-	// Previous tabs cannot inject replies into the newer active HWI request.
-	if _, err := standbyClient.Write(maskedFrame(2, []byte("ACK\r\nwrong\r\n"))); err != nil {
+	// Standby websites cannot inject replies into the active HWI request.
+	if _, err := browserClient.Write(maskedFrame(2, []byte("ACK\r\nwrong\r\n"))); err != nil {
 		t.Fatalf("write standby response: %v", err)
 	}
 	_ = hostClient.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
@@ -513,7 +535,7 @@ func TestBridgeRoundTrip(t *testing.T) {
 	}
 	_ = hostClient.SetReadDeadline(time.Time{})
 	response := []byte("ACK\r\ndeadbeef\r\n")
-	if _, err := browserClient.Write(maskedFrame(2, response)); err != nil {
+	if _, err := standbyClient.Write(maskedFrame(2, response)); err != nil {
 		t.Fatal(err)
 	}
 	_ = hostClient.SetReadDeadline(time.Now().Add(time.Second))
@@ -932,9 +954,10 @@ func TestBrowserHeartbeatKeepsResponsiveSessionAlive(t *testing.T) {
 	service := New("test", func() model.Settings { return model.DefaultSettings() }, nil)
 	server, client := newTestWebSocketPair(t)
 	defer client.Close()
+	readTimeout := 80 * time.Millisecond
 	done := make(chan struct{})
 	go func() {
-		service.handleBrowserWithHeartbeat(server, "test-tab", "https://example.com", 10*time.Millisecond, 100*time.Millisecond)
+		service.handleBrowserWithHeartbeat(server, "test-tab", "https://example.com", 10*time.Millisecond, readTimeout)
 		close(done)
 	}()
 	reader := bufio.NewReader(client)
@@ -942,7 +965,8 @@ func TestBrowserHeartbeatKeepsResponsiveSessionAlive(t *testing.T) {
 		t.Fatalf("hello opcode = %d, want text", opcode)
 	}
 	_ = client.SetReadDeadline(time.Now().Add(time.Second))
-	for index := 0; index < 3; index++ {
+	started := time.Now()
+	for index := 0; index < 15; index++ {
 		opcode, payload := readServerFrame(t, reader)
 		if opcode != 9 {
 			t.Fatalf("heartbeat opcode = %d, want ping", opcode)
@@ -951,8 +975,11 @@ func TestBrowserHeartbeatKeepsResponsiveSessionAlive(t *testing.T) {
 			t.Fatalf("send heartbeat pong: %v", err)
 		}
 	}
+	if time.Since(started) <= readTimeout {
+		t.Fatal("heartbeat test did not run longer than the configured read timeout")
+	}
 	if !service.Status().BrowserConnected {
-		t.Fatal("responsive browser was disconnected despite answering heartbeat pings")
+		t.Fatal("responsive browser was disconnected after more than the configured read timeout")
 	}
 	_ = client.Close()
 	select {

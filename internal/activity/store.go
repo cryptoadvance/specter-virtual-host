@@ -31,7 +31,6 @@ func Open(configPath string) (*Store, error) {
 		}
 		return nil, err
 	}
-	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 4096), 256*1024)
 	for scanner.Scan() {
@@ -40,10 +39,21 @@ func Open(configPath string) (*Store, error) {
 			store.entries = append(store.entries, entry)
 		}
 	}
+	scanErr := scanner.Err()
+	closeErr := file.Close()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
 	if len(store.entries) > maxEntries {
 		store.entries = append([]model.Activity(nil), store.entries[len(store.entries)-maxEntries:]...)
+		if err := store.rewriteLocked(); err != nil {
+			return nil, err
+		}
 	}
-	return store, scanner.Err()
+	return store, nil
 }
 
 func (s *Store) Add(kind, origin, message, result string) model.Activity {
@@ -55,17 +65,49 @@ func (s *Store) Add(kind, origin, message, result string) model.Activity {
 		Origin: origin, Message: message, Result: result,
 	}
 	s.entries = append(s.entries, entry)
+	rotated := len(s.entries) > maxEntries
 	if len(s.entries) > maxEntries {
 		s.entries = append([]model.Activity(nil), s.entries[len(s.entries)-maxEntries:]...)
 	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err == nil {
-		if file, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+		if rotated {
+			_ = s.rewriteLocked()
+		} else if file, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 			data, _ := json.Marshal(entry)
 			_, _ = file.Write(append(data, '\n'))
 			_ = file.Close()
 		}
 	}
 	return entry
+}
+
+func (s *Store) rewriteLocked() error {
+	file, err := os.CreateTemp(filepath.Dir(s.path), ".activity-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := file.Name()
+	defer os.Remove(temporaryPath)
+	defer file.Close()
+	if err := file.Chmod(0o600); err != nil {
+		return err
+	}
+	for _, entry := range s.entries {
+		data, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(append(data, '\n')); err != nil {
+			return err
+		}
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return replaceFile(temporaryPath, s.path)
 }
 
 func (s *Store) List() []model.Activity {

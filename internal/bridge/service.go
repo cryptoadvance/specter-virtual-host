@@ -77,7 +77,7 @@ type Service struct {
 	firstHostRequestTimeout   time.Duration
 	hostConnections           map[net.Conn]struct{}
 	quarantinedBrowserClients map[string]struct{}
-	legacyBrowserQuarantined  bool
+	legacyQuarantinedBrowser  *wsConn
 	webServer                 *http.Server
 	webListener               net.Listener
 	hwiListener               net.Listener
@@ -338,7 +338,7 @@ func (s *Service) quarantineBrowserLocked(ws *wsConn, clientID string) {
 		return
 	}
 	if clientID == "" {
-		s.legacyBrowserQuarantined = true
+		s.legacyQuarantinedBrowser = ws
 		return
 	}
 	if s.quarantinedBrowserClients == nil {
@@ -349,7 +349,7 @@ func (s *Service) quarantineBrowserLocked(ws *wsConn, clientID string) {
 
 func (s *Service) browserQuarantinedLocked(ws *wsConn, clientID string) bool {
 	if clientID == "" {
-		return s.legacyBrowserQuarantined
+		return ws != nil && s.legacyQuarantinedBrowser == ws
 	}
 	_, quarantined := s.quarantinedBrowserClients[clientID]
 	return quarantined
@@ -614,15 +614,12 @@ func (s *Service) attachBrowserWithReservation(ws *wsConn, clientID, origin stri
 	}
 	session := &browserSession{ws: ws, clientID: clientID, origin: origin}
 	s.browserSessions = append(s.browserSessions, session)
-	previous := s.browser
-	s.setActiveBrowserLocked(session)
-	previousHostConnected := previous != nil && s.host != nil && s.hostBrowser == previous
+	if s.browser == nil {
+		s.setActiveBrowserLocked(session)
+	}
 	hostConnected := s.host != nil && s.hostBrowser == ws
 	walletAllowed := s.walletAllowed
 	s.mu.Unlock()
-	if previous != nil && previous != ws {
-		writeBrowserHello(previous, s.version, previousHostConnected, walletAllowed)
-	}
 	writeBrowserHello(ws, s.version, hostConnected, walletAllowed)
 }
 
@@ -648,7 +645,7 @@ func (s *Service) detachBrowser(ws *wsConn) {
 		s.browser = nil
 		s.browserOrigin = ""
 		if count := len(s.browserSessions); count > 0 {
-			s.setActiveBrowserLocked(s.browserSessions[count-1])
+			s.setActiveBrowserLocked(s.browserSessions[0])
 		}
 	}
 	if s.hostBrowser == ws {
@@ -709,6 +706,9 @@ func (s *Service) handleBrowserWithHeartbeatReservation(ws *wsConn, clientID, or
 		_ = ws.conn.Close()
 		return
 	}
+	ws.conn.SetPongHandler(func(string) error {
+		return ws.conn.SetReadDeadline(time.Now().Add(readTimeout))
+	})
 	s.attachBrowserWithReservation(ws, clientID, origin, reserved)
 	stopHeartbeat := make(chan struct{})
 	heartbeatDone := make(chan struct{})

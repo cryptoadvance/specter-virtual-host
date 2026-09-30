@@ -128,10 +128,10 @@ jobs:
           export SPECTER_VIRTUAL_HOST_CONFIG="$RUNNER_TEMP/specter-vh-config.json"
           "$exe" status > "$RUNNER_TEMP/status.txt"
           grep -q 'Bridge:' "$RUNNER_TEMP/status.txt"
-          "$exe" status | grep -q 'Bridge:'
+          "$exe" status | grep -F 'Bridge:' > /dev/null
           printf 'unused input\n' | "$exe" status > /dev/null
           "$exe" settings set origin-policy trusted > /dev/null
-          file "$exe" | grep -q universal
+          file "$exe" | grep -F universal > /dev/null
       - name: Archive the Finder application bundle
         run: |
           mkdir -p dist
@@ -177,7 +177,7 @@ jobs:
           export SPECTER_VIRTUAL_HOST_CONFIG="$RUNNER_TEMP/specter-vh-config.json"
           "$exe" status > "$RUNNER_TEMP/status.txt"
           grep -q 'Bridge:' "$RUNNER_TEMP/status.txt"
-          "$exe" status | grep -q 'Bridge:'
+          "$exe" status | grep -F 'Bridge:' > /dev/null
           printf 'unused input\n' | "$exe" status > /dev/null
           "$exe" settings set origin-policy trusted > /dev/null
 
@@ -189,12 +189,12 @@ jobs:
           trap cleanup EXIT
           ready=false
           for _ in $(seq 1 60); do
-            if "$exe" status --json | grep -q '"running": true'; then ready=true; break; fi
+            if "$exe" status --json | grep -F '"running": true' > /dev/null; then ready=true; break; fi
             sleep 0.15
           done
           test "$ready" = true
           "$exe" bridge stop > /dev/null
-          "$exe" status --json | grep -q '"running": false'
+          "$exe" status --json | grep -F '"running": false' > /dev/null
           kill -TERM "$server_pid"
           wait "$server_pid"
           trap - EXIT
@@ -212,7 +212,7 @@ jobs:
           printf 'Package: specter-virtual-host\nVersion: %s\nSection: utils\nPriority: optional\nArchitecture: %s\nMaintainer: Specter DIY contributors\nDepends: ca-certificates, libgtk-3-0, libwebkit2gtk-4.1-0\nDescription: Specter DIY local virtual host bridge\n GUI, CLI, and headless bridge in one executable.\n' "$version" "$architecture" > "$package_root/DEBIAN/control"
           mkdir -p dist
           dpkg-deb --build --root-owner-group "$package_root" "dist/specter-virtual-host_${version}_${architecture}.deb"
-          dpkg-deb --contents "dist/specter-virtual-host_${version}_${architecture}.deb" | grep -q '/usr/bin/specter-virtual-host'
+          dpkg-deb --contents "dist/specter-virtual-host_${version}_${architecture}.deb" | grep -F '/usr/bin/specter-virtual-host' > /dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}

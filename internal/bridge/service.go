@@ -399,13 +399,9 @@ func (s *Service) serveBridge(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the bridge already has four connected websites", http.StatusTooManyRequests)
 		return
 	}
-	ws, err := upgradeWebSocket(w, r, func(request *http.Request) bool {
-		if request.Header.Get("Origin") == "" {
-			return true
-		}
-		_, allowed := s.requestOrigin(request)
-		return allowed
-	})
+	// The origin was checked above and may have been approved once for this
+	// request. Rechecking the persistent policy here would reject that approval.
+	ws, err := upgradeWebSocket(w, r, func(*http.Request) bool { return allowed })
 	if err != nil {
 		s.releaseBrowserReservation()
 		log.Printf("Unable to upgrade browser WebSocket: %v", err)

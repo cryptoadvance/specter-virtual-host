@@ -261,6 +261,62 @@ func TestUnknownOriginWaitsForApprovalInTrustedMode(t *testing.T) {
 	}
 }
 
+func TestServeBridgeAllowsUnknownOriginOnceWithoutTrustingIt(t *testing.T) {
+	settings := model.DefaultSettings()
+	settings.OriginPolicy = model.OriginPolicyTrusted
+	settings.NotifyNewSite = true
+	service := New("test", func() model.Settings { return settings }, nil)
+	server := httptest.NewServer(service.routes())
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		for _, request := range service.PendingRequests() {
+			_, _, _ = service.ResolveRequest(request.ID, false, nil)
+		}
+	})
+
+	const origin = "https://once-only.example"
+	header := http.Header{"Origin": []string{origin}}
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/bridge?client=allow-once-test"
+	type result struct {
+		conn     *websocket.Conn
+		response *http.Response
+		err      error
+	}
+	connected := make(chan result, 1)
+	go func() {
+		conn, response, err := websocket.DefaultDialer.Dial(endpoint, header)
+		connected <- result{conn: conn, response: response, err: err}
+	}()
+
+	waitForTestCondition(t, "the unknown-origin approval request", func() bool {
+		return len(service.PendingRequests()) == 1
+	})
+	request := service.PendingRequests()[0]
+	if request.Origin != origin {
+		t.Fatalf("approval origin = %q, want %q", request.Origin, origin)
+	}
+	if _, found, err := service.ResolveRequest(request.ID, true, nil); err != nil || !found {
+		t.Fatalf("allow once: found=%v err=%v", found, err)
+	}
+
+	var outcome result
+	select {
+	case outcome = <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WebSocket upgrade did not complete after allow-once approval")
+	}
+	if outcome.err != nil {
+		t.Fatalf("allow-once WebSocket upgrade failed (response %v): %v", outcome.response, outcome.err)
+	}
+	t.Cleanup(func() { _ = outcome.conn.Close() })
+	waitForBrowserSessions(t, service, 1)
+	for _, site := range settings.TrustedSites {
+		if site.Origin == origin {
+			t.Fatal("allow-once unexpectedly persisted the origin in TrustedSites")
+		}
+	}
+}
+
 func TestOpenModeDoesNotCreateApprovalRequest(t *testing.T) {
 	settings := model.DefaultSettings()
 	service := New("test", func() model.Settings { return settings }, nil)

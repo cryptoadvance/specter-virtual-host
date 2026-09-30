@@ -33,6 +33,9 @@ jobs:
       - name: Run Linux tests with WebKit2GTK 4.1
         if: runner.os == 'Linux'
         run: go test -tags webkit2_41 ./...
+      - name: Run Linux race detector
+        if: matrix.runner == 'ubuntu-22.04'
+        run: go test -race -tags webkit2_41 ./...
 
   build-windows:
     name: Build and exercise Windows CLI

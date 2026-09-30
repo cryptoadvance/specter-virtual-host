@@ -24,7 +24,7 @@ func StartServer(executor core.Executor) (*Server, error) {
 		return nil, err
 	}
 	server := &Server{listener: listener, executor: executor}
-	go server.accept()
+	go server.accept(listener)
 	return server, nil
 }
 
@@ -40,9 +40,9 @@ func (s *Server) Close() error {
 	return err
 }
 
-func (s *Server) accept() {
+func (s *Server) accept(listener net.Listener) {
 	for {
-		connection, err := s.listener.Accept()
+		connection, err := listener.Accept()
 		if err != nil {
 			return
 		}

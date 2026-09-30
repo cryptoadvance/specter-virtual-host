@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Specter Virtual Host",
+  "outputfilename": "Specter-Virtual-Host",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "info": {
+    "companyName": "CryptoAdvance",
+    "productName": "Specter Virtual Host",
+    "productVersion": "1.0.11",
+    "copyright": "Copyright © Specter DIY contributors",
+    "comments": "Local bridge for browser simulators and wallet software"
+  },
+  "author": {
+    "name": "Specter DIY contributors",
+    "email": ""
+  }
+}

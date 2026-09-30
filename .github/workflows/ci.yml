@@ -1,4 +1,4 @@
-name: Test and release
+name: Test and package
 
 on:
   push:
@@ -11,45 +11,242 @@ permissions:
 
 jobs:
   test:
-    name: Go tests
-    runs-on: ubuntu-latest
+    name: Go tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, macos-latest, ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-      - run: go test ./...
+          go-version: '1.25.x'
+      - name: Run tests
+        if: runner.os != 'Linux'
+        run: go test ./...
+      - name: Run Linux tests with WebKit2GTK 4.1
+        if: runner.os == 'Linux'
+        run: go test -tags webkit2_41 ./...
+      - name: Run Linux race detector
+        if: matrix.runner == 'ubuntu-22.04'
+        run: go test -race -tags webkit2_41 ./...
 
-  release:
-    name: Build release binaries
-    if: startsWith(github.ref, 'refs/tags/v')
+  build-windows:
+    name: Build and exercise Windows CLI
     needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-      - name: Build desktop binaries
-        shell: bash
+          go-version: '1.25.x'
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.15.0
+      - name: Build the single Windows application executable
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { 'dev' }
+          wails build -clean -m -skipbindings -windowsconsole -o Specter-Virtual-Host.exe -ldflags "-s -w -X main.version=$version"
+      - name: Exercise PowerShell and CMD streams, settings, and headless control
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'build/bin/Specter-Virtual-Host.exe'
+          $testRoot = Join-Path $env:RUNNER_TEMP 'specter-vh-cli-test'
+          New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
+          $env:SPECTER_VIRTUAL_HOST_CONFIG = Join-Path $testRoot 'config.json'
+
+          $statusFile = Join-Path $testRoot 'status.txt'
+          & $exe status > $statusFile
+          if ($LASTEXITCODE -ne 0 -or -not (Get-Content $statusFile -Raw).Contains('Bridge:')) { throw 'PowerShell redirection failed' }
+          $pipeOutput = & $exe status | Select-String 'Bridge:'
+          if ($LASTEXITCODE -ne 0 -or -not $pipeOutput) { throw 'PowerShell pipe failed' }
+          'ignored stdin' | & $exe status | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell stdin pipe failed' }
+
+          $cmdLine = '"' + $exe + '" status > "' + $statusFile + '"'
+          cmd.exe /d /c $cmdLine
+          if ($LASTEXITCODE -ne 0 -or -not (Get-Content $statusFile -Raw).Contains('Bridge:')) { throw 'CMD redirection failed' }
+          & $exe settings set origin-policy trusted | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'settings command failed' }
+          & $exe invalid-command 2>$null
+          if ($LASTEXITCODE -ne 2) { throw 'CLI usage exit code was not 2' }
+
+          $webSocket = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $hwiSocket = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $webSocket.Start(); $hwiSocket.Start()
+          $webPort = ([System.Net.IPEndPoint]$webSocket.LocalEndpoint).Port
+          $hwiPort = ([System.Net.IPEndPoint]$hwiSocket.LocalEndpoint).Port
+          $webSocket.Stop(); $hwiSocket.Stop()
+          $stdout = Join-Path $testRoot 'serve.out'
+          $stderr = Join-Path $testRoot 'serve.err'
+          $server = Start-Process -FilePath $exe -ArgumentList @('serve','--headless','--web-address',"127.0.0.1:$webPort",'--hwi-address',"127.0.0.1:$hwiPort") -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              Start-Sleep -Milliseconds 150
+              $snapshot = & $exe status --json | ConvertFrom-Json
+              if ($LASTEXITCODE -eq 0 -and $snapshot.bridge.running) { $ready = $true; break }
+            }
+            if (-not $ready) { throw 'Headless bridge did not start' }
+            & $exe bridge stop | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'bridge stop command failed' }
+            $snapshot = & $exe status --json | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $snapshot.bridge.running) { throw 'bridge stop did not stop the bridge' }
+          } finally {
+            if (-not $server.HasExited) { $server.Kill(); $server.WaitForExit() }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: build/bin/Specter-Virtual-Host.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: Build and exercise universal macOS app
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.15.0
+      - name: Build the universal app bundle
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then version=dev; fi
+          wails build -clean -m -skipbindings -platform darwin/universal -o Specter-Virtual-Host -ldflags "-s -w -X main.version=$version"
+      - name: Exercise the CLI from the app bundle
+        run: |
+          app="build/bin/Specter Virtual Host.app"
+          exe="$app/Contents/MacOS/Specter-Virtual-Host"
+          test -x "$exe"
+          export SPECTER_VIRTUAL_HOST_CONFIG="$RUNNER_TEMP/specter-vh-config.json"
+          "$exe" status > "$RUNNER_TEMP/status.txt"
+          grep -q 'Bridge:' "$RUNNER_TEMP/status.txt"
+          "$exe" status | grep -F 'Bridge:' > /dev/null
+          printf 'unused input\n' | "$exe" status > /dev/null
+          "$exe" settings set origin-policy trusted > /dev/null
+          file "$exe" | grep -F universal > /dev/null
+      - name: Archive the Finder application bundle
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent 'build/bin/Specter Virtual Host.app' 'dist/Specter-Virtual-Host-macOS-universal.zip'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/Specter-Virtual-Host-macOS-universal.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Build and exercise Linux ${{ matrix.arch }} package
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.15.0
+      - name: Build Linux executable
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then version=dev; fi
+          wails build -clean -m -skipbindings -tags webkit2_41 -o specter-virtual-host -ldflags "-s -w -X main.version=$version"
+      - name: Exercise Bash streams and headless control
+        run: |
+          set -euo pipefail
+          exe="$PWD/build/bin/specter-virtual-host"
+          export SPECTER_VIRTUAL_HOST_CONFIG="$RUNNER_TEMP/specter-vh-config.json"
+          "$exe" status > "$RUNNER_TEMP/status.txt"
+          grep -q 'Bridge:' "$RUNNER_TEMP/status.txt"
+          "$exe" status | grep -F 'Bridge:' > /dev/null
+          printf 'unused input\n' | "$exe" status > /dev/null
+          "$exe" settings set origin-policy trusted > /dev/null
+
+          web_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+          hwi_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+          "$exe" serve --headless --web-address "127.0.0.1:$web_port" --hwi-address "127.0.0.1:$hwi_port" > "$RUNNER_TEMP/serve.out" 2> "$RUNNER_TEMP/serve.err" &
+          server_pid=$!
+          cleanup() { kill -TERM "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          ready=false
+          for _ in $(seq 1 60); do
+            if "$exe" status --json | grep -F '"running": true' > /dev/null; then ready=true; break; fi
+            sleep 0.15
+          done
+          test "$ready" = true
+          "$exe" bridge stop > /dev/null
+          "$exe" status --json | grep -F '"running": false' > /dev/null
+          kill -TERM "$server_pid"
+          wait "$server_pid"
+          trap - EXIT
+      - name: Package the executable and desktop entry
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then version=0.0.0; fi
+          package_root="$RUNNER_TEMP/package-root"
+          mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" "$package_root/usr/share/applications" "$package_root/usr/share/icons/hicolor/512x512/apps"
+          install -m 0755 build/bin/specter-virtual-host "$package_root/usr/bin/specter-virtual-host"
+          install -m 0644 packaging/linux/specter-virtual-host.desktop "$package_root/usr/share/applications/specter-virtual-host.desktop"
+          install -m 0644 build/appicon.png "$package_root/usr/share/icons/hicolor/512x512/apps/specter-virtual-host.png"
+          architecture=$(dpkg --print-architecture)
+          printf 'Package: specter-virtual-host\nVersion: %s\nSection: utils\nPriority: optional\nArchitecture: %s\nMaintainer: Specter DIY contributors\nDepends: ca-certificates, libgtk-3-0, libwebkit2gtk-4.1-0\nDescription: Specter DIY local virtual host bridge\n GUI, CLI, and headless bridge in one executable.\n' "$version" "$architecture" > "$package_root/DEBIAN/control"
           mkdir -p dist
-          build() {
-            local os="$1" arch="$2" name="$3"
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath \
-              -ldflags "-s -w -X main.version=$version" \
-              -o "dist/$name" .
-          }
-          build windows amd64 Specter-Virtual-Host-Windows-x64.exe
-          build linux amd64 Specter-Virtual-Host-Linux-x64
-          build darwin amd64 Specter-Virtual-Host-macOS-x64
-          build darwin arm64 Specter-Virtual-Host-macOS-arm64
-          sha256sum dist/* > dist/SHA256SUMS
-      - name: Publish GitHub release
+          dpkg-deb --build --root-owner-group "$package_root" "dist/specter-virtual-host_${version}_${architecture}.deb"
+          dpkg-deb --contents "dist/specter-virtual-host_${version}_${architecture}.deb" | grep -F '/usr/bin/specter-virtual-host' > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-windows
+      - build-macos
+      - build-linux
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > ../SHA256SUMS
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* SHA256SUMS --generate-notes

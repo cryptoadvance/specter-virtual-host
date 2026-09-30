@@ -1,0 +1,15 @@
+[Unit]
+Description=Specter Virtual Host headless bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/specter-virtual-host serve --headless
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

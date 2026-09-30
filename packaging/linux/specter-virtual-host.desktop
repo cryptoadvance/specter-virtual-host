@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Specter Virtual Host
+Comment=Local bridge for browser simulators and wallet software
+Exec=specter-virtual-host %U
+TryExec=specter-virtual-host
+Icon=specter-virtual-host
+Terminal=false
+Type=Application
+Categories=Utility;Network;
+StartupWMClass=Specter Virtual Host

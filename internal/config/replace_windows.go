@@ -3,20 +3,17 @@
 package config
 
 import (
-	"errors"
-	"os"
+	"golang.org/x/sys/windows"
 )
 
 func replaceFile(source, destination string) error {
-	err := os.Rename(source, destination)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, os.ErrExist) && !errors.Is(err, os.ErrPermission) {
+	from, err := windows.UTF16PtrFromString(source)
+	if err != nil {
 		return err
 	}
-	if removeErr := os.Remove(destination); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+	to, err := windows.UTF16PtrFromString(destination)
+	if err != nil {
 		return err
 	}
-	return os.Rename(source, destination)
+	return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
 }

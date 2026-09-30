@@ -30,6 +30,7 @@ const (
 	requestTimeout           = 30 * time.Second
 	maxPendingRequests       = 32
 	maxHostConnections       = 64
+	maxBrowserConnections    = 4
 	hostFirstRequestTimeout  = 5 * time.Second
 	hostResponseWriteTimeout = 15 * time.Second
 	browserPingInterval      = 20 * time.Second
@@ -61,6 +62,7 @@ type Service struct {
 	walletAllowed             bool
 	browser                   *wsConn
 	browserSessions           []*browserSession
+	browserReservations       int
 	browserClientID           string
 	browserOrigin             string
 	host                      net.Conn
@@ -392,13 +394,43 @@ func (s *Service) serveBridge(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "open the newest connected simulator tab", http.StatusConflict)
 		return
 	}
-	ws, err := acceptWebSocket(w, r)
+	if !s.reserveBrowserConnection() {
+		s.addActivity("website", origin, "Website connection limit reached", "blocked")
+		http.Error(w, "the bridge already has four connected websites", http.StatusTooManyRequests)
+		return
+	}
+	ws, err := upgradeWebSocket(w, r, func(request *http.Request) bool {
+		if request.Header.Get("Origin") == "" {
+			return true
+		}
+		_, allowed := s.requestOrigin(request)
+		return allowed
+	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.releaseBrowserReservation()
+		log.Printf("Unable to upgrade browser WebSocket: %v", err)
 		return
 	}
 	s.addActivity("website", origin, "Website connected to the bridge", "allowed")
-	s.handleBrowser(ws, clientID, origin)
+	s.handleBrowserWithReservation(ws, clientID, origin)
+}
+
+func (s *Service) reserveBrowserConnection() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.browserSessions)+s.browserReservations >= maxBrowserConnections {
+		return false
+	}
+	s.browserReservations++
+	return true
+}
+
+func (s *Service) releaseBrowserReservation() {
+	s.mu.Lock()
+	if s.browserReservations > 0 {
+		s.browserReservations--
+	}
+	s.mu.Unlock()
 }
 
 func (s *Service) serveHealth(w http.ResponseWriter, r *http.Request) {
@@ -566,7 +598,14 @@ func (s *Service) sendStatusTo(ws *wsConn, kind string, connected bool) {
 }
 
 func (s *Service) attachBrowser(ws *wsConn, clientID, origin string) {
+	s.attachBrowserWithReservation(ws, clientID, origin, false)
+}
+
+func (s *Service) attachBrowserWithReservation(ws *wsConn, clientID, origin string, reserved bool) {
 	s.mu.Lock()
+	if reserved && s.browserReservations > 0 {
+		s.browserReservations--
+	}
 	for _, session := range s.browserSessions {
 		if session.ws == ws {
 			s.mu.Unlock()
@@ -649,6 +688,14 @@ func (s *Service) handleBrowser(ws *wsConn, clientID, origin string) {
 }
 
 func (s *Service) handleBrowserWithHeartbeat(ws *wsConn, clientID, origin string, pingInterval, readTimeout time.Duration) {
+	s.handleBrowserWithHeartbeatReservation(ws, clientID, origin, pingInterval, readTimeout, false)
+}
+
+func (s *Service) handleBrowserWithReservation(ws *wsConn, clientID, origin string) {
+	s.handleBrowserWithHeartbeatReservation(ws, clientID, origin, browserPingInterval, browserReadTimeout, true)
+}
+
+func (s *Service) handleBrowserWithHeartbeatReservation(ws *wsConn, clientID, origin string, pingInterval, readTimeout time.Duration, reserved bool) {
 	if pingInterval <= 0 {
 		pingInterval = browserPingInterval
 	}
@@ -656,10 +703,13 @@ func (s *Service) handleBrowserWithHeartbeat(ws *wsConn, clientID, origin string
 		readTimeout = browserReadTimeout
 	}
 	if err := ws.conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		if reserved {
+			s.releaseBrowserReservation()
+		}
 		_ = ws.conn.Close()
 		return
 	}
-	s.attachBrowser(ws, clientID, origin)
+	s.attachBrowserWithReservation(ws, clientID, origin, reserved)
 	stopHeartbeat := make(chan struct{})
 	heartbeatDone := make(chan struct{})
 	go func() {
@@ -730,13 +780,6 @@ func (s *Service) handleBrowserWithHeartbeat(ws *wsConn, clientID, origin string
 					s.addActivity("response", origin, message, "returned")
 				}
 			}
-		case 8:
-			_ = ws.writeFrame(8, nil)
-			return
-		case 9:
-			_ = ws.writeFrame(10, payload)
-		case 10:
-			// Reading the browser's automatic Pong refreshes the liveness deadline.
 		}
 	}
 }

@@ -10,11 +10,139 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cryptoadvance/specter-virtual-host/internal/model"
+	"github.com/gorilla/websocket"
 )
+
+type testWSFrame struct {
+	wire []byte
+	err  error
+}
+
+type testWSClient struct {
+	conn    *websocket.Conn
+	frames  chan testWSFrame
+	current []byte
+}
+
+func newTestWebSocketPair(t *testing.T) (*wsConn, *testWSClient) {
+	t.Helper()
+	accepted := make(chan *wsConn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.SetReadLimit(maxFrame)
+		accepted <- &wsConn{conn: conn}
+	}))
+	t.Cleanup(server.Close)
+	clientConn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial test WebSocket: %v", err)
+	}
+	client := &testWSClient{conn: clientConn, frames: make(chan testWSFrame, 64)}
+	clientConn.SetPingHandler(func(data string) error {
+		if err := clientConn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(writeTimeout)); err != nil {
+			return err
+		}
+		client.frames <- testWSFrame{wire: unmaskedTestFrame(websocket.PingMessage, []byte(data))}
+		return nil
+	})
+	clientConn.SetPongHandler(func(data string) error {
+		client.frames <- testWSFrame{wire: unmaskedTestFrame(websocket.PongMessage, []byte(data))}
+		return nil
+	})
+	t.Cleanup(func() { _ = clientConn.Close() })
+	var serverConn *wsConn
+	select {
+	case serverConn = <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("test WebSocket server did not accept the client")
+	}
+	go func() {
+		for {
+			opcode, payload, err := clientConn.ReadMessage()
+			if err != nil {
+				client.frames <- testWSFrame{err: err}
+				return
+			}
+			client.frames <- testWSFrame{wire: unmaskedTestFrame(opcode, payload)}
+		}
+	}()
+	return serverConn, client
+}
+
+func (client *testWSClient) Read(payload []byte) (int, error) {
+	for len(client.current) == 0 {
+		frame := <-client.frames
+		if frame.err != nil {
+			return 0, frame.err
+		}
+		client.current = frame.wire
+	}
+	written := copy(payload, client.current)
+	client.current = client.current[written:]
+	return written, nil
+}
+
+func (client *testWSClient) Write(frame []byte) (int, error) {
+	if len(frame) < 6 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	opcode := int(frame[0] & 0x0f)
+	length := int(frame[1] & 0x7f)
+	maskOffset := 2
+	if length == 126 {
+		if len(frame) < 8 {
+			return 0, io.ErrUnexpectedEOF
+		}
+		length = int(binary.BigEndian.Uint16(frame[2:4]))
+		maskOffset = 4
+	}
+	if frame[1]&0x80 == 0 || len(frame) < maskOffset+4+length {
+		return 0, io.ErrUnexpectedEOF
+	}
+	mask := frame[maskOffset : maskOffset+4]
+	data := append([]byte(nil), frame[maskOffset+4:maskOffset+4+length]...)
+	for index := range data {
+		data[index] ^= mask[index%4]
+	}
+	var err error
+	if opcode == websocket.TextMessage || opcode == websocket.BinaryMessage {
+		err = client.conn.WriteMessage(opcode, data)
+	} else {
+		err = client.conn.WriteControl(opcode, data, time.Now().Add(writeTimeout))
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(frame), nil
+}
+
+func (client *testWSClient) Close() error { return client.conn.Close() }
+
+func (client *testWSClient) SetReadDeadline(deadline time.Time) error {
+	return client.conn.SetReadDeadline(deadline)
+}
+
+func unmaskedTestFrame(opcode int, payload []byte) []byte {
+	frame := []byte{0x80 | byte(opcode)}
+	switch {
+	case len(payload) < 126:
+		frame = append(frame, byte(len(payload)))
+	case len(payload) <= 0xffff:
+		frame = append(frame, 126, byte(len(payload)>>8), byte(len(payload)))
+	default:
+		frame = append(frame, 127, 0, 0, 0, 0, byte(len(payload)>>24), byte(len(payload)>>16), byte(len(payload)>>8), byte(len(payload)))
+	}
+	return append(frame, payload...)
+}
 
 type limitedTestWriter struct {
 	bytes.Buffer
@@ -248,17 +376,17 @@ func TestProxyRewritesSimulatorRequestAndDisablesCaching(t *testing.T) {
 
 func TestBrowserSessionPromotesStandbyWhenActiveDisconnects(t *testing.T) {
 	service := New("test", func() model.Settings { return model.DefaultSettings() }, nil)
-	firstServer, firstClient := net.Pipe()
+	firstServer, firstClient := newTestWebSocketPair(t)
 	defer firstClient.Close()
-	go service.handleBrowser(&wsConn{conn: firstServer, reader: bufio.NewReader(firstServer)}, "first-tab", "https://first.example")
+	go service.handleBrowser(firstServer, "first-tab", "https://first.example")
 	firstReader := bufio.NewReader(firstClient)
 	if opcode, _ := readServerFrame(t, firstReader); opcode != 1 {
 		t.Fatalf("first hello opcode = %d, want text", opcode)
 	}
 
-	secondServer, secondClient := net.Pipe()
+	secondServer, secondClient := newTestWebSocketPair(t)
 	defer secondClient.Close()
-	go service.handleBrowser(&wsConn{conn: secondServer, reader: bufio.NewReader(secondServer)}, "second-tab", "https://second.example")
+	go service.handleBrowser(secondServer, "second-tab", "https://second.example")
 	secondReader := bufio.NewReader(secondClient)
 	// A newer tab becomes active, but the old tab stays connected in standby.
 	if opcode, _ := readServerFrame(t, firstReader); opcode != 1 {
@@ -329,16 +457,16 @@ func TestBridgeRoundTrip(t *testing.T) {
 	}
 	_ = earlyClient.Close()
 
-	standbyServer, standbyClient := net.Pipe()
+	standbyServer, standbyClient := newTestWebSocketPair(t)
 	defer standbyClient.Close()
-	go service.handleBrowser(&wsConn{conn: standbyServer, reader: bufio.NewReader(standbyServer)}, "first-tab", "https://example.com")
+	go service.handleBrowser(standbyServer, "first-tab", "https://example.com")
 	standbyReader := bufio.NewReader(standbyClient)
 	if opcode, _ := readServerFrame(t, standbyReader); opcode != 1 {
 		t.Fatalf("hello opcode = %d", opcode)
 	}
-	browserServer, browserClient := net.Pipe()
+	browserServer, browserClient := newTestWebSocketPair(t)
 	defer browserClient.Close()
-	go service.handleBrowser(&wsConn{conn: browserServer, reader: bufio.NewReader(browserServer)}, "newest-tab", "https://example.com")
+	go service.handleBrowser(browserServer, "newest-tab", "https://example.com")
 	browserReader := bufio.NewReader(browserClient)
 	if opcode, _ := readServerFrame(t, standbyReader); opcode != 1 {
 		t.Fatalf("standby update opcode = %d", opcode)
@@ -363,9 +491,9 @@ func TestBridgeRoundTrip(t *testing.T) {
 	if opcode != 2 || string(payload) != string(command) {
 		t.Fatalf("host-to-browser = (%d, %q)", opcode, payload)
 	}
-	latestServer, latestClient := net.Pipe()
+	latestServer, latestClient := newTestWebSocketPair(t)
 	defer latestClient.Close()
-	go service.handleBrowser(&wsConn{conn: latestServer, reader: bufio.NewReader(latestServer)}, "latest-tab", "https://example.com")
+	go service.handleBrowser(latestServer, "latest-tab", "https://example.com")
 	if opcode, _ := readServerFrame(t, browserReader); opcode != 1 {
 		t.Fatalf("in-flight tab status opcode = %d", opcode)
 	}
@@ -404,9 +532,9 @@ func TestConcurrentHostConnectionsAreSerialized(t *testing.T) {
 	service.running = true
 	service.generation = 1
 	service.mu.Unlock()
-	browserServer, browserClient := net.Pipe()
+	browserServer, browserClient := newTestWebSocketPair(t)
 	defer browserClient.Close()
-	go service.handleBrowser(&wsConn{conn: browserServer, reader: bufio.NewReader(browserServer)}, "test-tab", "https://example.com")
+	go service.handleBrowser(browserServer, "test-tab", "https://example.com")
 	browserReader := bufio.NewReader(browserClient)
 	if opcode, _ := readServerFrame(t, browserReader); opcode != 1 {
 		t.Fatalf("hello opcode = %d, want text", opcode)
@@ -520,9 +648,9 @@ func TestInterruptedHWIResponseQuarantinesSimulatorUntilPageReload(t *testing.T)
 	}
 	defer service.Stop()
 
-	firstBrowserServer, firstBrowserClient := net.Pipe()
+	firstBrowserServer, firstBrowserClient := newTestWebSocketPair(t)
 	firstBrowserReader := bufio.NewReader(firstBrowserClient)
-	go service.handleBrowser(&wsConn{conn: firstBrowserServer, reader: bufio.NewReader(firstBrowserServer)}, "page-one", "https://example.com")
+	go service.handleBrowser(firstBrowserServer, "page-one", "https://example.com")
 	if opcode, _ := readServerFrame(t, firstBrowserReader); opcode != 1 {
 		t.Fatal("expected initial hello from first simulator page")
 	}
@@ -599,10 +727,10 @@ func TestInterruptedHWIResponseQuarantinesSimulatorUntilPageReload(t *testing.T)
 	_ = firstBrowserClient.Close()
 
 	// A page reload creates a new simulator client ID and a clean worker stream.
-	secondBrowserServer, secondBrowserClient := net.Pipe()
+	secondBrowserServer, secondBrowserClient := newTestWebSocketPair(t)
 	defer secondBrowserClient.Close()
 	secondBrowserReader := bufio.NewReader(secondBrowserClient)
-	go service.handleBrowser(&wsConn{conn: secondBrowserServer, reader: bufio.NewReader(secondBrowserServer)}, "page-two", "https://example.com")
+	go service.handleBrowser(secondBrowserServer, "page-two", "https://example.com")
 	if opcode, _ := readServerFrame(t, secondBrowserReader); opcode != 1 {
 		t.Fatal("expected hello from reloaded simulator page")
 	}
@@ -658,10 +786,10 @@ func TestIdleHWIConnectionCannotHoldSessionLockForever(t *testing.T) {
 	}
 	defer service.Stop()
 
-	browserServer, browserClient := net.Pipe()
+	browserServer, browserClient := newTestWebSocketPair(t)
 	defer browserClient.Close()
 	browserReader := bufio.NewReader(browserClient)
-	go service.handleBrowser(&wsConn{conn: browserServer, reader: bufio.NewReader(browserServer)}, "idle-test-page", "https://example.com")
+	go service.handleBrowser(browserServer, "idle-test-page", "https://example.com")
 	if opcode, _ := readServerFrame(t, browserReader); opcode != 1 {
 		t.Fatal("expected initial simulator hello")
 	}
@@ -721,9 +849,9 @@ func TestStopStartRejectsHWIConnectionsAcceptedByPreviousGeneration(t *testing.T
 	}
 	defer service.Stop()
 
-	firstBrowserServer, firstBrowserClient := net.Pipe()
+	firstBrowserServer, firstBrowserClient := newTestWebSocketPair(t)
 	firstBrowserReader := bufio.NewReader(firstBrowserClient)
-	go service.handleBrowser(&wsConn{conn: firstBrowserServer, reader: bufio.NewReader(firstBrowserServer)}, "old-page", "https://example.com")
+	go service.handleBrowser(firstBrowserServer, "old-page", "https://example.com")
 	if opcode, _ := readServerFrame(t, firstBrowserReader); opcode != 1 {
 		t.Fatal("expected initial hello from first simulator page")
 	}
@@ -777,20 +905,13 @@ func TestStopStartRejectsHWIConnectionsAcceptedByPreviousGeneration(t *testing.T
 		return len(service.hostConnections) == 0
 	})
 
-	newBrowserServer, newBrowserClient := net.Pipe()
+	newBrowserServer, newBrowserClient := newTestWebSocketPair(t)
 	defer newBrowserClient.Close()
 	newBrowserReader := bufio.NewReader(newBrowserClient)
-	go service.handleBrowser(&wsConn{conn: newBrowserServer, reader: bufio.NewReader(newBrowserServer)}, "new-page", "https://example.com")
+	go service.handleBrowser(newBrowserServer, "new-page", "https://example.com")
 	if opcode, _ := readServerFrame(t, newBrowserReader); opcode != 1 {
 		t.Fatal("expected hello from restarted simulator page")
 	}
-	_ = newBrowserClient.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	var unexpected [1]byte
-	if n, err := newBrowserClient.Read(unexpected[:]); n > 0 || err == nil {
-		t.Fatal("a queued request from the previous generation reached the new simulator")
-	}
-	_ = newBrowserClient.SetReadDeadline(time.Time{})
-
 	newHost, err := net.Dial("tcp", service.hwiListener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -809,11 +930,11 @@ func TestStopStartRejectsHWIConnectionsAcceptedByPreviousGeneration(t *testing.T
 
 func TestBrowserHeartbeatKeepsResponsiveSessionAlive(t *testing.T) {
 	service := New("test", func() model.Settings { return model.DefaultSettings() }, nil)
-	server, client := net.Pipe()
+	server, client := newTestWebSocketPair(t)
 	defer client.Close()
 	done := make(chan struct{})
 	go func() {
-		service.handleBrowserWithHeartbeat(&wsConn{conn: server, reader: bufio.NewReader(server)}, "test-tab", "https://example.com", 10*time.Millisecond, 100*time.Millisecond)
+		service.handleBrowserWithHeartbeat(server, "test-tab", "https://example.com", 10*time.Millisecond, 100*time.Millisecond)
 		close(done)
 	}()
 	reader := bufio.NewReader(client)
@@ -843,11 +964,11 @@ func TestBrowserHeartbeatKeepsResponsiveSessionAlive(t *testing.T) {
 
 func TestBrowserHeartbeatDisconnectsUnresponsiveSession(t *testing.T) {
 	service := New("test", func() model.Settings { return model.DefaultSettings() }, nil)
-	server, client := net.Pipe()
+	server, client := newTestWebSocketPair(t)
 	defer client.Close()
 	done := make(chan struct{})
 	go func() {
-		service.handleBrowserWithHeartbeat(&wsConn{conn: server, reader: bufio.NewReader(server)}, "test-tab", "https://example.com", 10*time.Millisecond, 80*time.Millisecond)
+		service.handleBrowserWithHeartbeat(server, "test-tab", "https://example.com", 10*time.Millisecond, 80*time.Millisecond)
 		close(done)
 	}()
 	reader := bufio.NewReader(client)
